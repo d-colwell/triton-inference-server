@@ -30,6 +30,7 @@
 #include <deque>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 #include "src/backends/backend/tritonbackend.h"
@@ -39,6 +40,10 @@
   return TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_INTERNAL, (M).c_str())
 #define TRITONJSON_STATUSSUCCESS nullptr
 #include "src/core/json.h"
+
+#ifdef TRITON_ENABLE_GPU
+#include <cuda_runtime_api.h>
+#endif  // TRITON_ENABLE_GPU
 
 namespace nvidia { namespace inferenceserver { namespace backend {
 
@@ -78,12 +83,35 @@ namespace nvidia { namespace inferenceserver { namespace backend {
     }                                                 \
   } while (false)
 
+#define RETURN_ERROR_IF_TRUE(P, C, MSG)               \
+  do {                                                \
+    if ((P)) {                                        \
+      return TRITONSERVER_ErrorNew(C, (MSG).c_str()); \
+    }                                                 \
+  } while (false)
+
 #define RETURN_IF_ERROR(X)               \
   do {                                   \
     TRITONSERVER_Error* rie_err__ = (X); \
     if (rie_err__ != nullptr) {          \
       return rie_err__;                  \
     }                                    \
+  } while (false)
+
+#define RESPOND_AND_SET_NULL_IF_ERROR(RESPONSE_PTR, X)               \
+  do {                                                               \
+    TRITONSERVER_Error* rarie_err__ = (X);                           \
+    if (rarie_err__ != nullptr) {                                    \
+      if (*RESPONSE_PTR != nullptr) {                                \
+        LOG_IF_ERROR(                                                \
+            TRITONBACKEND_ResponseSend(                              \
+                *RESPONSE_PTR, TRITONSERVER_RESPONSE_COMPLETE_FINAL, \
+                rarie_err__),                                        \
+            "failed to send error response");                        \
+        *RESPONSE_PTR = nullptr;                                     \
+      }                                                              \
+      TRITONSERVER_ErrorDelete(rarie_err__);                         \
+    }                                                                \
   } while (false)
 
 #ifdef TRITON_ENABLE_STATS
@@ -102,6 +130,10 @@ namespace nvidia { namespace inferenceserver { namespace backend {
 #define SET_TIMESTAMP(TS_NS)
 #endif  // TRITON_ENABLE_STATS
 
+#ifndef TRITON_ENABLE_GPU
+using cudaStream_t = void*;
+#endif  // !TRITON_ENABLE_GPU
+
 /// Convenience deleter for TRITONBACKEND_ResponseFactory.
 struct ResponseFactoryDeleter {
   void operator()(TRITONBACKEND_ResponseFactory* f)
@@ -118,7 +150,7 @@ struct ResponseFactoryDeleter {
 /// Configuration information for a model instance.
 ///
 struct InstanceProperties {
-  enum class Kind { CPU, GPU };
+  enum class Kind { CPU, GPU, MODEL };
 
   InstanceProperties(const size_t i, const Kind k, const int d)
       : id_(i), kind_(k), device_id_(d)
@@ -128,8 +160,8 @@ struct InstanceProperties {
 
   size_t id_;
 
-  // For CPU device_id_ is always 0. For GPU device_id_ indicates the
-  // GPU device to be used by the instance.
+  // For CPU and MODEL, device_id_ is always 0. For GPU,
+  // device_id_ indicates the GPU device to be used by the instance.
   Kind kind_;
   int device_id_;
 };
@@ -194,6 +226,16 @@ class BlockingQueue {
   std::deque<T> queue_;
 };
 
+/// The value for a dimension in a shape that indicates that that
+/// dimension can take on any size.
+constexpr int WILDCARD_DIM = -1;
+
+constexpr char kTensorRTExecutionAccelerator[] = "tensorrt";
+constexpr char kOpenVINOExecutionAccelerator[] = "openvino";
+constexpr char kGPUIOExecutionAccelerator[] = "gpu_io";
+constexpr char kAutoMixedPrecisionExecutionAccelerator[] =
+    "auto_mixed_precision";
+
 /// Parse model configuration and extra the model instances that
 /// should be implemented for the specified instance groups.
 ///
@@ -228,6 +270,42 @@ std::string ShapeToString(const int64_t* dims, const size_t dims_count);
 /// \return The string representation.
 std::string ShapeToString(const std::vector<int64_t>& shape);
 
+/// Return the string representation of a Triton server data type.
+///
+/// \param dtype The Triton server data type.
+/// \return The string representation.
+std::string DataTypeToString(TRITONSERVER_DataType dtype);
+
+/// Return the number of elements of a shape.
+///
+/// \param dims The shape dimensions.
+/// \param dims_count The number of dimensions.
+/// \return The number of elements.
+int64_t GetElementCount(const int64_t* dims, const size_t dims_count);
+
+/// Return the number of elements of a shape.
+///
+/// \param shape The shape as a vector of dimensions.
+/// \return The number of elements.
+int64_t GetElementCount(const std::vector<int64_t>& shape);
+
+/// Get the size of objects of a given datatype in bytes.
+/// \param dtype The data-type.
+/// \return The size, in bytes, of objects of the datatype, or 0 if
+/// size cannot be determine (for example, values of type TYPE_STRING
+/// have variable length and so size cannot be determine just from the
+/// type).
+size_t GetDataTypeByteSize(const TRITONSERVER_DataType& dtype);
+
+/// Get the size, in bytes, of a tensor based on datatype and
+/// shape.
+/// \param dtype The data-type.
+/// \param dims The shape.
+/// \return The size, in bytes, of the corresponding tensor, or -1 if
+/// unable to determine the size.
+int64_t GetByteSize(
+    const TRITONSERVER_DataType& dtype, const std::vector<int64_t>& dims);
+
 /// Get an input tensor's contents into a buffer.
 ///
 /// \param request The inference request.
@@ -242,5 +320,85 @@ std::string ShapeToString(const std::vector<int64_t>& shape);
 TRITONSERVER_Error* ReadInputTensor(
     TRITONBACKEND_Request* request, const std::string& input_name, char* buffer,
     size_t* buffer_byte_size);
+
+/// Validate that an input matches one of the allowed input names.
+/// \param io The model input.
+/// \param allowed The set of allowed input names.
+/// \return The error status. A non-OK status indicates the input
+/// is not valid.
+TRITONSERVER_Error* CheckAllowedModelInput(
+    TritonJson::Value& io, const std::set<std::string>& allowed);
+
+/// Validate that an output matches one of the allowed output names.
+/// \param io The model output.
+/// \param allowed The set of allowed output names.
+/// \return The error status. A non-OK status indicates the output
+/// is not valid.
+TRITONSERVER_Error* CheckAllowedModelOutput(
+    TritonJson::Value& io, const std::set<std::string>& allowed);
+
+/// Get the tensor name, false value, and true value for a boolean
+/// sequence batcher control kind. If 'required' is true then must
+/// find a tensor for the control. If 'required' is false, return
+/// 'tensor_name' as empty-string if the control is not mapped to any
+/// tensor.
+///
+/// \param batcher The JSON object of the sequence batcher.
+/// \param model_name The name of the model.
+/// \param control_kind The kind of control tensor to look for.
+/// \param required Whether the tensor must be specified.
+/// \param tensor_name Returns the name of the tensor.
+/// \param tensor_datatype Returns the data type of the tensor.
+/// \param fp32_false_value Returns the float value for false if
+/// the tensor type is FP32.
+/// \param fp32_true_value Returns the float value for true if
+/// the tensor type is FP32.
+/// \param int32_false_value Returns the int value for false if
+/// the tensor type is FP32.
+/// \param int32_true_value Returns the int value for true if
+/// the tensor type is FP32.
+/// \return a TRITONSERVER_Error indicating success or failure.
+TRITONSERVER_Error* GetBooleanSequenceControlProperties(
+    TritonJson::Value& batcher, const std::string& model_name,
+    const std::string& control_kind, const bool required,
+    std::string* tensor_name, std::string* tensor_datatype,
+    float* fp32_false_value, float* fp32_true_value, int32_t* int32_false_value,
+    int32_t* int32_true_value);
+
+/// Get the tensor name and datatype for a non-boolean sequence
+/// batcher control kind. If 'required' is true then must find a
+/// tensor for the control. If 'required' is false, return
+/// 'tensor_name' as empty-string if the control is not mapped to any
+/// tensor. 'tensor_datatype' returns the required datatype for the
+/// control.
+///
+/// \param batcher The JSON object of the sequence batcher.
+/// \param model_name The name of the model.
+/// \param control_kind The kind of control tensor to look for.
+/// \param required Whether the tensor must be specified.
+/// \param tensor_name Returns the name of the tensor.
+/// \param tensor_datatype Returns the data type of the tensor.
+/// \return a TRITONSERVER_Error indicating success or failure.
+TRITONSERVER_Error* GetTypedSequenceControlProperties(
+    TritonJson::Value& batcher, const std::string& model_name,
+    const std::string& control_kind, const bool required,
+    std::string* tensor_name, std::string* tensor_datatype);
+
+/// Copy buffer from 'src' to 'dst' for given 'byte_size'. The buffer location
+/// is identified by the memory type and id, and the corresponding copy will be
+/// initiated.
+/// 'msg' is the message to be prepended in error message.
+/// 'cuda_stream' specifies the stream to be associated with, and 0 can be
+/// passed for default stream.
+/// 'cuda_used' returns whether a CUDA memory copy is initiated. If true,
+/// the caller should synchronize on the given 'cuda_stream' to ensure data copy
+/// is completed.
+/// \return The error status.
+TRITONSERVER_Error* CopyBuffer(
+    const std::string& msg, const TRITONSERVER_MemoryType src_memory_type,
+    const int64_t src_memory_type_id,
+    const TRITONSERVER_MemoryType dst_memory_type,
+    const int64_t dst_memory_type_id, const size_t byte_size, const void* src,
+    void* dst, cudaStream_t cuda_stream, bool* cuda_used);
 
 }}}  // namespace nvidia::inferenceserver::backend
